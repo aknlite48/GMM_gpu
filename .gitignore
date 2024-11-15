@@ -1,0 +1,8 @@
+*.exe
+*.out
+*.bin
+*
+!*.*
+*.csv
+.DS_Store
+**/.DS_Store
