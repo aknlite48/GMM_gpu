@@ -19,6 +19,12 @@ n_clusters = int(sys.argv[2])  # Adjust this as needed
 kmeans = KMeans(n_clusters=n_clusters, random_state=42,n_init='auto')
 labels = kmeans.fit_predict(X)
 
+weights = np.bincount(labels) / n_samples
+
+# Save weights to 'weights.csv'
+weights_df = pd.DataFrame(weights)
+weights_df.to_csv('weights.csv', index=False, header=False)
+
 # Retrieve cluster centers (means)
 means = kmeans.cluster_centers_
 

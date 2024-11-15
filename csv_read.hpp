@@ -19,8 +19,9 @@ void read_data(float* q,std::string fname) {
         while (std::getline(ss, item, ',')) {
             //row.push_back(std::stof(item)); 
             *(q+i)=std::stof(item);
+            i++;
         }
-        q.push_back(row);
+        //q.push_back(row);
 }
     file.close();
 }
