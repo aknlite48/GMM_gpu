@@ -137,6 +137,7 @@ __global__ void E_step(float* gaussians,float* pi_k,float* resp,float* resp_deno
 		int x_n = tid/K; //xn = d_data[(x_n*D):(x_n)]
 //		int k_n = tid%K;
 		resp[tid] = gaussians[tid]/resp_denom[x_n];
+//		printf("E: %f",resp[tid]);
 	}
 }
 
@@ -170,7 +171,7 @@ __global__ void M_step_uk_update(float* resp,float* data,float* n_k,float *u_k,i
 	int tid0 = threadIdx.x;
 	int tot_threads = blockDim.x;
 
-	extern __shared__ float shared_val[];
+	__shared__ float shared_val[10];
 	for (int i=0;i<D;i++) {
 		shared_val[i]=0;
 	}
@@ -181,18 +182,20 @@ __global__ void M_step_uk_update(float* resp,float* data,float* n_k,float *u_k,i
 	for (int tid=tid0;tid<N;tid+=tot_threads) {
 		for (int i=0;i<D;i++) {
 			shared_val[i]+=resp[(tid*K)+bid]*data[(tid*D)+i];
+			//printf(" M_resp: %f \n",resp[(tid*K)+bid]);
+//			printf(" M_data: %f \n",data[(tid*D)+i]);
 		}
 	}
 	__syncthreads();
 
 	//atomic add:
 	if (tid0==0) {
-	printf("invoked!");
+//	printf("invoked!");
 		for (int i=0;i<D;i++) {
 			u_k[(bid*D)+i] = shared_val[i]/n_k[bid];
-			printf("%f ",u_k[(bid*D)+i]);
+//			printf("%f ",u_k[(bid*D)+i]);
 		}
-		printf("\n");
+//		printf("\n");
 	}
 }
 
@@ -205,7 +208,7 @@ __global__ void M_step_Ek_update(float* resp,float* data,float* u_k,float* E_k,f
 	int size = D*D;
 
 
-	extern __shared__ float shared_mat[]; 
+	__shared__ float shared_mat[100]; 
 
 	for (int i=0;i<size;i++) {
 		shared_mat[i]=0;
@@ -250,7 +253,7 @@ __global__ void copy_LL(float* log_LL,float* prev_log_LL) {
 
 int main() {
 
-	int K=5; int D=2; int N=200;
+	int K=3; int D=2; int N=200;
 	float pi_k[K];
 	float u_k[(K*D)];
 	float E_k[(K*D*D)];
@@ -323,6 +326,8 @@ int main() {
 
 
 	//cuda memcpy
+	cudaMemcpy(d_data,data,N*D*sizeof(float),cudaMemcpyHostToDevice);
+
 	cudaMemcpy(d_pi_k,pi_k,alloc_size1,cudaMemcpyHostToDevice);
 	cudaMemcpy(d_u_k,u_k,alloc_size2,cudaMemcpyHostToDevice);
 	cudaMemcpy(d_E_k,E_k,alloc_size3,cudaMemcpyHostToDevice);
@@ -331,7 +336,7 @@ int main() {
 	cudaMemcpy(d_prev_log_LL,&log_LL,sizeof(float),cudaMemcpyHostToDevice);
 
 
-
+for (int i=0;i<10;i++) {
 	//kernel invocation
 	//calculate E matrix inverse and determinant
 	matrixInverse<<<K,1>>>(d_E_k,d_E_k_inv,d_E_k_det,D);
@@ -357,10 +362,11 @@ int main() {
 	pi_k_update<<<1,K>>>(d_pi_k,d_n_k,K,N);
 	cudaDeviceSynchronize();
 
-	cudaMemcpy(u_k,d_u_k,alloc_size2,cudaMemcpyDeviceToHost);
-	cudaMemcpy(E_k,d_E_k,alloc_size3,cudaMemcpyDeviceToHost);
+//	cudaMemcpy(u_k,d_u_k,alloc_size2,cudaMemcpyDeviceToHost);
+//	cudaMemcpy(E_k,d_E_k,alloc_size3,cudaMemcpyDeviceToHost);
 	cudaMemcpy(&log_LL,d_log_LL,sizeof(float),cudaMemcpyDeviceToHost);
 	//print
+	/*
 	printf("after:");
 	printf("\n");
     printf("means: \n");	
@@ -383,14 +389,12 @@ int main() {
 	}
 
 
-	printf("\n");
-	printf("LL \n");
-	cout << log_LL << endl;
+	printf("\n"); */
+	printf("LL: %f \n",log_LL);
+//	cout << log_LL << endl;
+}
 
 }
 
-
-
-//kernel code:
 
 
