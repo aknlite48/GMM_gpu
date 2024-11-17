@@ -1,35 +1,7 @@
+#include <cuda_runtime.h>
 #include <iostream>
-#include <vector>
-#include <cuda.h>
+#include "kernels.h" 
 
-# define M_PI 3.14159265358979323846  /* pi */
-
-using namespace std;
-
-#include "csv_read.hpp"
-
-//initial params means(u_k),variances (E_k) and mixing(pi_k)
-//D dim data | N points | K clusters
-
-/*
-Params
-pi_k = [*]xK
-u_k  = [*,*]x(K,D)      | access: (i*D)+j
-E_k  = [*,*,*]x(K,D,D)  | access: k*(D*D) +(i*D) + j
-gaussians = [*,*]x(N,K) | access: i*K + j
-
-resp = [*,*]x(N,K)      | access: i*K + j
-
-E_k_inv = [*,*,*]x(K,D,D)  | access: k*(D*D) +(i*D) + j
-
-Data point:
-Dataset = [*,*]x(N,D)   | access: i*(D) + j
-
-
-*/
-
-
-//kernels
 __global__ void matrixInverse(float *matrices, float *inverses, float *determinants, int n) {
     int idx = blockIdx.x; // Each block handles one matrix
 
@@ -232,7 +204,7 @@ __global__ void pi_k_update(float* pi_k,float* n_k,int K,int N) {
 	}
 }
 
-__global__ void add_label(float* resp,float* labels,int N,int K) {
+__global__ void add_label(float* resp,int* labels,int N,int K) {
 	//multiblock
 	int tid0 = (blockIdx.x*blockDim.x)+threadIdx.x;
 	int tot_threads = gridDim.x*blockDim.x;
@@ -249,7 +221,7 @@ __global__ void add_label(float* resp,float* labels,int N,int K) {
 	}
 }
 
-void GMM_training(float* pi_k,float* u_k,float* E_k,float* data,int K,int D,int N,float threshold) {
+extern "C" void GMM_training(float* pi_k,float* u_k,float* E_k,float* data,int K,int D,int N,float threshold) {
 
 	float log_LL=0; float prev_log_LL=0;
 
@@ -356,7 +328,7 @@ void GMM_training(float* pi_k,float* u_k,float* E_k,float* data,int K,int D,int 
 	cudaFree(d_data);
 }
 
-void GMM_inference(float* labels,float* pi_k,float* u_k,float* E_k,float* data,int K,int D,int N) {
+extern "C" void GMM_inference(int* labels,float* pi_k,float* u_k,float* E_k,float* data,int K,int D,int N) {
 	
 	float* d_data;
 	
@@ -377,7 +349,7 @@ void GMM_inference(float* labels,float* pi_k,float* u_k,float* E_k,float* data,i
 	float* d_n_k;
 	float* d_log_LL;
 
-	float* d_labels;
+	int* d_labels;
 
 	//cuda alloc
 	int alloc_size1 = K*sizeof(float);
@@ -399,7 +371,7 @@ void GMM_inference(float* labels,float* pi_k,float* u_k,float* E_k,float* data,i
 	cudaMalloc((void**)&d_n_k,alloc_size1);
 
 	cudaMalloc((void**)&d_log_LL,sizeof(float));
-	cudaMalloc((void**)&d_labels,N*sizeof(float));
+	cudaMalloc((void**)&d_labels,N*sizeof(int));
 
 	//cuda memcpy
 	cudaMemcpy(d_data,data,N*D*sizeof(float),cudaMemcpyHostToDevice);
@@ -425,70 +397,21 @@ void GMM_inference(float* labels,float* pi_k,float* u_k,float* E_k,float* data,i
 	E_step<<<20,250>>>(d_gaussians,d_pi_k,d_resp,d_resp_denom,N,K);
 	cudaDeviceSynchronize();
 
-	//add_label<<20,250>>(d_resp,d_labels,N,K);
-	//cudaDeviceSynchronize();
+	add_label<<<20,250>>>(d_resp,d_labels,N,K);
+	cudaDeviceSynchronize();
 
 	cudaMemcpy(labels,d_labels,N*sizeof(float),cudaMemcpyDeviceToHost);
 
-	//write cuda Frees
+    cudaFree(d_pi_k);
+    cudaFree(d_u_k);
+    cudaFree(d_E_k);
+    cudaFree(d_E_k_inv);
+        cudaFree(d_E_k_det);
+        cudaFree(d_gaussians);
+        cudaFree(d_resp);
+        cudaFree(d_resp_denom);
+        cudaFree(d_log_LL);
+        cudaFree(d_n_k);
+        cudaFree(d_data);
+	cudaFree(d_labels);
 }
-
-int main(int argc,char* argv[]) {
-	if (argc!=9) {
-		cout << "Incorrect Usage | -K num -D num -N num" << endl;
-		return 1;
-	}
-
-	int K, D,  N; float threshold;
-
-    for (int i = 1; i < argc; ++i) {
-        string arg = argv[i];
-
-        if (arg == "-N") {
-            if (i + 1 < argc) { // Check if there is a value after the flag
-                N = std::stoi(argv[++i]); // Parse the next argument as an integer
-
-            } 
-        } else if (arg == "-K") {
-                        if (i + 1 < argc) { // Check if there is a value after the flag
-                K = std::stoi(argv[++i]); // Parse the next argument as an integer
-
-            } 
-        } else if (arg=="-D") {
-        	            if (i + 1 < argc) { // Check if there is a value after the flag
-                D = std::stoi(argv[++i]); // Parse the next argument as an integer
-
-            } 
-        } else if (arg=="-T") {
-                            if (i + 1 < argc) { // Check if there is a value after the flag
-                threshold = std::stof(argv[++i]); // Parse the next argument as an integer
-
-            }
-} 
-    }
-
-    float pi_k[K];
-	float u_k[(K*D)];
-	float E_k[(K*D*D)];
-	float data[(N*D)];
-	read_data(data,"data.csv");
-	read_data(pi_k,"weights.csv");
-	read_data(u_k,"means.csv");
-	read_data(E_k,"covariances.csv");
-
-	//training:
-	GMM_training(pi_k,u_k,E_k,data,K,D,N,threshold);
-
-
-
-
-
-
-    //inference
-    float * data_inf;
-    read_data(data_inf,"infr.csv"); int inf_size = 500;
-
-
-
-}
-
