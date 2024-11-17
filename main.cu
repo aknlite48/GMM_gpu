@@ -425,8 +425,8 @@ void GMM_inference(float* labels,float* pi_k,float* u_k,float* E_k,float* data,i
 	E_step<<<20,250>>>(d_gaussians,d_pi_k,d_resp,d_resp_denom,N,K);
 	cudaDeviceSynchronize();
 
-	add_label<<20,250>>(d_resp,d_labels,N,K);
-	cudaDeviceSynchronize();
+	//add_label<<20,250>>(d_resp,d_labels,N,K);
+	//cudaDeviceSynchronize();
 
 	cudaMemcpy(labels,d_labels,N*sizeof(float),cudaMemcpyDeviceToHost);
 
