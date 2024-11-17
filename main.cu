@@ -231,10 +231,39 @@ __global__ void pi_k_update(float* pi_k,float* n_k,int K,int N) {
 		pi_k[tid] = n_k[tid]/N;
 	}
 }
+int main(int argc,char* argv[]) {
+	if (argc!=9) {
+		cout << "Incorrect Usage | -K num -D num -N num" << endl;
+		return 1;
+	}
 
-int main() {
+	int K, D,  N; float threshold;
 
-	int K=3; int D=2; int N=200;
+    for (int i = 1; i < argc; ++i) {
+        string arg = argv[i];
+
+        if (arg == "-N") {
+            if (i + 1 < argc) { // Check if there is a value after the flag
+                N = std::stoi(argv[++i]); // Parse the next argument as an integer
+
+            } 
+        } else if (arg == "-K") {
+                        if (i + 1 < argc) { // Check if there is a value after the flag
+                K = std::stoi(argv[++i]); // Parse the next argument as an integer
+
+            } 
+        } else if (arg=="-D") {
+        	            if (i + 1 < argc) { // Check if there is a value after the flag
+                D = std::stoi(argv[++i]); // Parse the next argument as an integer
+
+            } 
+        } else if (arg=="-T") {
+                            if (i + 1 < argc) { // Check if there is a value after the flag
+                threshold = std::stof(argv[++i]); // Parse the next argument as an integer
+
+            }
+} 
+    }
 	float pi_k[K];
 	float u_k[(K*D)];
 	float E_k[(K*D*D)];
@@ -323,14 +352,12 @@ int main() {
 
 	cudaMemcpy(d_log_LL,&log_LL,sizeof(float),cudaMemcpyHostToDevice);
 
-int max_iter = 500; float threshold=0.00001;
+int max_iter = 500;
 for (int i=0;i<max_iter;i++) {
 	//kernel invocation
 	//calculate E matrix inverse and determinant
 	matrixInverse<<<K,1>>>(d_E_k,d_E_k_inv,d_E_k_det,D);
 	cudaDeviceSynchronize();
-
-
 
 	//M Step : calc gaussians & update responsibilities
 	gauss_calc<<<20,250>>>(d_gaussians,d_data,d_u_k,d_E_k_inv,d_E_k_det,d_pi_val,N,K,D);
@@ -353,53 +380,22 @@ for (int i=0;i<max_iter;i++) {
 	pi_k_update<<<1,K>>>(d_pi_k,d_n_k,K,N);
 	cudaDeviceSynchronize();
 
-	cudaMemcpy(pi_k,d_pi_k,alloc_size1,cudaMemcpyDeviceToHost);
-	cudaMemcpy(u_k,d_u_k,alloc_size2,cudaMemcpyDeviceToHost);
-	cudaMemcpy(E_k,d_E_k,alloc_size3,cudaMemcpyDeviceToHost);
 	cudaMemcpy(&log_LL,d_log_LL,sizeof(float),cudaMemcpyDeviceToHost);
-	//print
-	/*
-	printf("after:");
-	printf("\n");
-	printf("weights \n");
-	for (int i=0;i<K;i++) {
-		cout << pi_k[i] << " ";
-	}
-	printf("\n");
-    printf("means: \n");	
-	for (int i=0;i<K;i++) {
-		for (int j=0;j<D;j++) {
-			cout << u_k[(i*D)+j] << " ";
-		}
-	printf("\n");
-	}
-	printf("\n");
-	printf("covariances: \n");
-	for (int k=0;k<K;k++) {
-		for (int i=0;i<D;i++) {
-			for (int j=0;j<D;j++) {
-				cout << E_k[(D*D*k)+(i*D)+j] << " ";
-			}
-		printf("\n");
-		}
-		printf("\n");
-	}
 
-
-	printf("\n");*/ 
 	//compare logs
+	printf("LL: %f iter: %d \n",log_LL,i);
 	if (abs(log_LL-prev_log_LL)<threshold) {
 		break;
 	}
 	prev_log_LL = log_LL;
-	printf("LL: %f iter: %d \n",log_LL,i);
 //	cout << log_LL << endl;
 }
-
+        cudaMemcpy(pi_k,d_pi_k,alloc_size1,cudaMemcpyDeviceToHost);
+        cudaMemcpy(u_k,d_u_k,alloc_size2,cudaMemcpyDeviceToHost);
+        cudaMemcpy(E_k,d_E_k,alloc_size3,cudaMemcpyDeviceToHost);
 }
 
 
 
 //kernel code:
-
 
