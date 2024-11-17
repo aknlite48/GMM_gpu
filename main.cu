@@ -231,6 +231,208 @@ __global__ void pi_k_update(float* pi_k,float* n_k,int K,int N) {
 		pi_k[tid] = n_k[tid]/N;
 	}
 }
+
+__global__ void add_label(float* resp,float* labels,int N,int K) {
+	//multiblock
+	int tid0 = (blockIdx.x*blockDim.x)+threadIdx.x;
+	int tot_threads = gridDim.x*blockDim.x;
+
+	for (int tid=tid0;tid<N;tid+=tot_threads) {
+		float cmax = resp[(tid*K)]; int maxi=0;
+		for (int i=1;i<K;i++) {
+			float val = resp[(tid*K)+i];
+			if (val>cmax) {
+				cmax = val; maxi=i;
+			}
+		}
+		labels[tid] = maxi;
+	}
+}
+
+void GMM_training(float* pi_k,float* u_k,float* E_k,float* data,int K,int D,int N,float threshold) {
+
+	float log_LL=0; float prev_log_LL=0;
+
+	float* d_data;
+	
+	float pi_val_calc = 2*M_PI; for (int i=1;i<D;i++) {pi_val_calc*=2*M_PI;}
+	float* d_pi_val;
+    cudaMalloc((void**)&d_pi_val,sizeof(float)); 
+	cudaMemcpy(d_pi_val,&pi_val_calc, sizeof(float),cudaMemcpyHostToDevice);
+
+	float* d_pi_k;
+	float* d_u_k;
+	float* d_E_k;
+	float* d_E_k_inv;
+	float* d_E_k_det;
+
+	float* d_gaussians;
+	float* d_resp;
+	float* d_resp_denom;
+	float* d_n_k;
+	float* d_log_LL;
+
+	//cuda alloc
+	int alloc_size1 = K*sizeof(float);
+	int alloc_size2 = K*D*sizeof(float);
+	int alloc_size3 = K*D*D*sizeof(float);
+	int alloc_size4 = N*K*sizeof(float);
+
+	cudaMalloc((void**)&d_data,D*N*sizeof(float));
+
+	cudaMalloc((void**)&d_pi_k,alloc_size1);
+	cudaMalloc((void**)&d_u_k,alloc_size2);
+	cudaMalloc((void**)&d_E_k,alloc_size3);
+	cudaMalloc((void**)&d_E_k_inv,alloc_size3);
+	cudaMalloc((void**)&d_E_k_det,alloc_size1);
+
+	cudaMalloc((void**)&d_gaussians,alloc_size4);
+	cudaMalloc((void**)&d_resp,alloc_size4);
+	cudaMalloc((void**)&d_resp_denom,N*sizeof(float));
+	cudaMalloc((void**)&d_n_k,alloc_size1);
+
+	cudaMalloc((void**)&d_log_LL,sizeof(float));
+
+
+	//cuda memcpy
+	cudaMemcpy(d_data,data,N*D*sizeof(float),cudaMemcpyHostToDevice);
+
+	cudaMemcpy(d_pi_k,pi_k,alloc_size1,cudaMemcpyHostToDevice);
+	cudaMemcpy(d_u_k,u_k,alloc_size2,cudaMemcpyHostToDevice);
+	cudaMemcpy(d_E_k,E_k,alloc_size3,cudaMemcpyHostToDevice);
+
+
+	int max_iter = 500;
+	for (int i=0;i<max_iter;i++) {
+		//kernel invocation
+		//calculate E matrix inverse and determinant
+		matrixInverse<<<K,1>>>(d_E_k,d_E_k_inv,d_E_k_det,D);
+		cudaDeviceSynchronize();
+
+		//M Step : calc gaussians & update responsibilities
+		gauss_calc<<<20,250>>>(d_gaussians,d_data,d_u_k,d_E_k_inv,d_E_k_det,d_pi_val,N,K,D);
+		cudaDeviceSynchronize();
+
+		cudaMemset(d_log_LL, 0, sizeof(float));
+		resp_denom_update<<<20,250>>>(d_gaussians,d_pi_k,d_resp_denom,d_log_LL,N,K);
+		cudaDeviceSynchronize();
+
+		E_step<<<20,250>>>(d_gaussians,d_pi_k,d_resp,d_resp_denom,N,K);
+		cudaDeviceSynchronize();
+
+		M_step_nk_update<<<K,250>>>(d_resp,d_data,d_n_k,d_u_k,N,K,D);
+		cudaDeviceSynchronize();
+
+		M_step_uk_update<<<K,250>>>(d_resp,d_data,d_n_k,d_u_k,N,K,D);
+		cudaDeviceSynchronize();
+
+		M_step_Ek_update<<<K,250>>>(d_resp,d_data,d_u_k,d_E_k,d_n_k,N,K,D);
+		pi_k_update<<<1,K>>>(d_pi_k,d_n_k,K,N);
+		cudaDeviceSynchronize();
+
+		cudaMemcpy(&log_LL,d_log_LL,sizeof(float),cudaMemcpyDeviceToHost);
+
+		//compare logs
+		printf("LL: %f iter: %d \n",log_LL,i);
+		if (abs(log_LL-prev_log_LL)<threshold) {
+			break;
+		}
+		prev_log_LL = log_LL;
+	}
+    cudaMemcpy(pi_k,d_pi_k,alloc_size1,cudaMemcpyDeviceToHost);
+    cudaMemcpy(u_k,d_u_k,alloc_size2,cudaMemcpyDeviceToHost);
+    cudaMemcpy(E_k,d_E_k,alloc_size3,cudaMemcpyDeviceToHost);
+
+    cudaFree(d_pi_k);
+    cudaFree(d_u_k);
+    cudaFree(d_E_k);
+    cudaFree(d_E_k_inv);
+	cudaFree(d_E_k_det);
+	cudaFree(d_gaussians);
+	cudaFree(d_resp);
+	cudaFree(d_resp_denom);
+	cudaFree(d_log_LL);
+	cudaFree(d_n_k);
+	cudaFree(d_data);
+}
+
+void GMM_inference(float* labels,float* pi_k,float* u_k,float* E_k,float* data,int K,int D,int N) {
+	
+	float* d_data;
+	
+	float pi_val_calc = 2*M_PI; for (int i=1;i<D;i++) {pi_val_calc*=2*M_PI;}
+	float* d_pi_val;
+    cudaMalloc((void**)&d_pi_val,sizeof(float)); 
+	cudaMemcpy(d_pi_val,&pi_val_calc, sizeof(float),cudaMemcpyHostToDevice);
+
+	float* d_pi_k;
+	float* d_u_k;
+	float* d_E_k;
+	float* d_E_k_inv;
+	float* d_E_k_det;
+
+	float* d_gaussians;
+	float* d_resp;
+	float* d_resp_denom;
+	float* d_n_k;
+	float* d_log_LL;
+
+	float* d_labels;
+
+	//cuda alloc
+	int alloc_size1 = K*sizeof(float);
+	int alloc_size2 = K*D*sizeof(float);
+	int alloc_size3 = K*D*D*sizeof(float);
+	int alloc_size4 = N*K*sizeof(float);
+
+	cudaMalloc((void**)&d_data,D*N*sizeof(float));
+
+	cudaMalloc((void**)&d_pi_k,alloc_size1);
+	cudaMalloc((void**)&d_u_k,alloc_size2);
+	cudaMalloc((void**)&d_E_k,alloc_size3);
+	cudaMalloc((void**)&d_E_k_inv,alloc_size3);
+	cudaMalloc((void**)&d_E_k_det,alloc_size1);
+
+	cudaMalloc((void**)&d_gaussians,alloc_size4);
+	cudaMalloc((void**)&d_resp,alloc_size4);
+	cudaMalloc((void**)&d_resp_denom,N*sizeof(float));
+	cudaMalloc((void**)&d_n_k,alloc_size1);
+
+	cudaMalloc((void**)&d_log_LL,sizeof(float));
+	cudaMalloc((void**)&d_labels,N*sizeof(float));
+
+	//cuda memcpy
+	cudaMemcpy(d_data,data,N*D*sizeof(float),cudaMemcpyHostToDevice);
+
+	cudaMemcpy(d_pi_k,pi_k,alloc_size1,cudaMemcpyHostToDevice);
+	cudaMemcpy(d_u_k,u_k,alloc_size2,cudaMemcpyHostToDevice);
+	cudaMemcpy(d_E_k,E_k,alloc_size3,cudaMemcpyHostToDevice);
+
+
+
+    //setting up inference:
+	matrixInverse<<<K,1>>>(d_E_k,d_E_k_inv,d_E_k_det,D);
+	cudaDeviceSynchronize();
+
+	//M Step : calc gaussians & update responsibilities
+	gauss_calc<<<20,250>>>(d_gaussians,d_data,d_u_k,d_E_k_inv,d_E_k_det,d_pi_val,N,K,D);
+	cudaDeviceSynchronize();
+
+	cudaMemset(d_log_LL, 0, sizeof(float));
+	resp_denom_update<<<20,250>>>(d_gaussians,d_pi_k,d_resp_denom,d_log_LL,N,K);
+	cudaDeviceSynchronize();
+
+	E_step<<<20,250>>>(d_gaussians,d_pi_k,d_resp,d_resp_denom,N,K);
+	cudaDeviceSynchronize();
+
+	add_label<<20,250>>(d_resp,d_labels,N,K);
+	cudaDeviceSynchronize();
+
+	cudaMemcpy(labels,d_labels,N*sizeof(float),cudaMemcpyDeviceToHost);
+
+	//write cuda Frees
+}
+
 int main(int argc,char* argv[]) {
 	if (argc!=9) {
 		cout << "Incorrect Usage | -K num -D num -N num" << endl;
@@ -264,138 +466,29 @@ int main(int argc,char* argv[]) {
             }
 } 
     }
-	float pi_k[K];
+
+    float pi_k[K];
 	float u_k[(K*D)];
 	float E_k[(K*D*D)];
 	float data[(N*D)];
-
-
-	float log_LL=0; float prev_log_LL=0;
-
 	read_data(data,"data.csv");
 	read_data(pi_k,"weights.csv");
 	read_data(u_k,"means.csv");
 	read_data(E_k,"covariances.csv");
-/*
-	//before gpu data check:
-	printf("before:");
-		printf("\n");
-        printf("weights \n");
-        for (int i=0;i<K;i++) {
-                cout << pi_k[i] << " ";
-        }
-        printf("\n");
-    printf("means: \n");	
-	for (int i=0;i<K;i++) {
-		for (int j=0;j<D;j++) {
-			cout << u_k[(i*D)+j] << " ";
-		}
-	printf("\n");
-	}
-	printf("\n");
-	printf("covariances: \n");
-	for (int k=0;k<K;k++) {
-		for (int i=0;i<D;i++) {
-			for (int j=0;j<D;j++) {
-				cout << E_k[(D*D*k)+(i*D)+j] << " ";
-			}
-		printf("\n");
-		}
-		printf("\n");
-	}
-*/
-	float* d_data;
-	float pi_val_calc = 2*M_PI; for (int i=1;i<D;i++) {pi_val_calc*=2*M_PI;}
-	float* d_pi_val;
-       	cudaMalloc((void**)&d_pi_val,sizeof(float)); 
-	cudaMemcpy(d_pi_val,&pi_val_calc, sizeof(float),cudaMemcpyHostToDevice);
 
-	float* d_pi_k;
-	float* d_u_k;
-	float* d_E_k;
-	float* d_E_k_inv;
-	float* d_E_k_det;
-
-	float* d_gaussians;
-	float* d_resp;
-	float* d_resp_denom;
-	float* d_n_k;
-	float* d_log_LL;
-
-	//cuda alloc
-	int alloc_size1 = K*sizeof(float);
-	int alloc_size2 = K*D*sizeof(float);
-	int alloc_size3 = K*D*D*sizeof(float);
-	int alloc_size4 = N*K*sizeof(float);
-
-	cudaMalloc((void**)&d_data,D*N*sizeof(float));
-
-	cudaMalloc((void**)&d_pi_k,alloc_size1);
-	cudaMalloc((void**)&d_u_k,alloc_size2);
-	cudaMalloc((void**)&d_E_k,alloc_size3);
-	cudaMalloc((void**)&d_E_k_inv,alloc_size3);
-	cudaMalloc((void**)&d_E_k_det,alloc_size1);
-
-	cudaMalloc((void**)&d_gaussians,alloc_size4);
-	cudaMalloc((void**)&d_resp,alloc_size4);
-	cudaMalloc((void**)&d_resp_denom,N*sizeof(float));
-	cudaMalloc((void**)&d_log_LL,sizeof(float));
-	cudaMalloc((void**)&d_n_k,alloc_size1);
+	//training:
+	GMM_training(pi_k,u_k,E_k,data,K,D,N,threshold);
 
 
-	//cuda memcpy
-	cudaMemcpy(d_data,data,N*D*sizeof(float),cudaMemcpyHostToDevice);
 
-	cudaMemcpy(d_pi_k,pi_k,alloc_size1,cudaMemcpyHostToDevice);
-	cudaMemcpy(d_u_k,u_k,alloc_size2,cudaMemcpyHostToDevice);
-	cudaMemcpy(d_E_k,E_k,alloc_size3,cudaMemcpyHostToDevice);
 
-	cudaMemcpy(d_log_LL,&log_LL,sizeof(float),cudaMemcpyHostToDevice);
 
-int max_iter = 500;
-for (int i=0;i<max_iter;i++) {
-	//kernel invocation
-	//calculate E matrix inverse and determinant
-	matrixInverse<<<K,1>>>(d_E_k,d_E_k_inv,d_E_k_det,D);
-	cudaDeviceSynchronize();
 
-	//M Step : calc gaussians & update responsibilities
-	gauss_calc<<<20,250>>>(d_gaussians,d_data,d_u_k,d_E_k_inv,d_E_k_det,d_pi_val,N,K,D);
-	cudaDeviceSynchronize();
+    //inference
+    float * data_inf;
+    read_data(data_inf,"infr.csv"); int inf_size = 500;
 
-	cudaMemset(d_log_LL, 0, sizeof(float));
-	resp_denom_update<<<20,250>>>(d_gaussians,d_pi_k,d_resp_denom,d_log_LL,N,K);
-	cudaDeviceSynchronize();
 
-	E_step<<<20,250>>>(d_gaussians,d_pi_k,d_resp,d_resp_denom,N,K);
-	cudaDeviceSynchronize();
 
-	M_step_nk_update<<<K,250>>>(d_resp,d_data,d_n_k,d_u_k,N,K,D);
-	cudaDeviceSynchronize();
-
-	M_step_uk_update<<<K,250>>>(d_resp,d_data,d_n_k,d_u_k,N,K,D);
-	cudaDeviceSynchronize();
-
-	M_step_Ek_update<<<K,250>>>(d_resp,d_data,d_u_k,d_E_k,d_n_k,N,K,D);
-	pi_k_update<<<1,K>>>(d_pi_k,d_n_k,K,N);
-	cudaDeviceSynchronize();
-
-	cudaMemcpy(&log_LL,d_log_LL,sizeof(float),cudaMemcpyDeviceToHost);
-
-	//compare logs
-	printf("LL: %f iter: %d \n",log_LL,i);
-	if (abs(log_LL-prev_log_LL)<threshold) {
-		break;
-	}
-	prev_log_LL = log_LL;
-//	cout << log_LL << endl;
 }
-        cudaMemcpy(pi_k,d_pi_k,alloc_size1,cudaMemcpyDeviceToHost);
-        cudaMemcpy(u_k,d_u_k,alloc_size2,cudaMemcpyDeviceToHost);
-        cudaMemcpy(E_k,d_E_k,alloc_size3,cudaMemcpyDeviceToHost);
-}
-
-
-
-//kernel code:
 
