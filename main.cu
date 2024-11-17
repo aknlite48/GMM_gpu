@@ -46,9 +46,7 @@ __global__ void matrixInverse(float *matrices, float *inverses, float *determina
 
     float determinant = 1; // Initialize determinant
 
-    // Perform Gauss-Jordan elimination
     for (int i = 0; i < n; i++) {
-        // Make the diagonal element 1 and update the determinant
         float diagElement = matrix[i * n + i];
         if (diagElement == 0) {
             printf("Singular matrix detected\n");
@@ -74,11 +72,11 @@ __global__ void matrixInverse(float *matrices, float *inverses, float *determina
         }
     }
 
-    determinants[idx] = determinant; // Store the determinant
+    determinants[idx] = fabs(determinant); // abs of det : fix 4
 }
 
 
-__global__ void gauss_calc(float* d_gaussians,float* data,float* u_k,float* E_k_inv,float* E_k_det,int N,int K,int D) {
+__global__ void gauss_calc(float* d_gaussians,float* data,float* u_k,float* E_k_inv,float* E_k_det,float* pi_val,int N,int K,int D) {
 	//multi block
 
 	int tid0 = (blockIdx.x*blockDim.x)+threadIdx.x;
@@ -98,14 +96,13 @@ __global__ void gauss_calc(float* d_gaussians,float* data,float* u_k,float* E_k_
 		for (int i=0;i<D;i++) {
 			float temp_val=0;
 			for (int j=0;j<D;j++) {
-				temp_val+=E_k_inv[(size*k_n)+(D*i)+j]*x_minus_u[j];
+				temp_val+=E_k_inv[(D*D*k_n)+(D*i)+j]*x_minus_u[j]; //access mistake : fix 1
 			}
 			final_val+=x_minus_u[i]*temp_val;
 		}
 
 		//gaussian function
-		d_gaussians[tid] = exp((-final_val)/2)*rsqrt(pow(M_PI,(float)D)*E_k_det[k_n]);
-
+		d_gaussians[tid] =  exp((-final_val)/2)*rsqrt((*pi_val)*E_k_det[k_n]); //exp((-final_val)/2);
 	}
 }
 
@@ -123,8 +120,9 @@ __global__ void resp_denom_update(float* gaussians,float* pi_k,float* resp_denom
 			sum+=gaussians[(tid*K)+i]*pi_k[i];
 		}
 		resp_denom[tid]=sum;
-		*(log_LL)+=log(sum);
+		atomicAdd(log_LL,log(sum));  //added atomic add : fix 2
 	}
+
 }
 
 __global__ void E_step(float* gaussians,float* pi_k,float* resp,float* resp_denom,int N,int K) {
@@ -135,9 +133,8 @@ __global__ void E_step(float* gaussians,float* pi_k,float* resp,float* resp_deno
 	int size = N*K;
 	for (int tid=tid0;tid<size;tid+=tot_threads) {
 		int x_n = tid/K; //xn = d_data[(x_n*D):(x_n)]
-//		int k_n = tid%K;
-		resp[tid] = gaussians[tid]/resp_denom[x_n];
-//		printf("E: %f",resp[tid]);
+		int k_n = tid%K;
+		resp[tid] =  pi_k[k_n]*gaussians[tid]/resp_denom[x_n]; //update rule not included pi: fix 3
 	}
 }
 
@@ -154,13 +151,12 @@ __global__ void M_step_nk_update(float* resp,float* data,float* n_k,float *u_k,i
 	//Nk calc
 	for (int tid=tid0;tid<N;tid+=tot_threads) {
 
-		sum+=resp[(tid*K)+bid];
+		atomicAdd(&sum,resp[(tid*K)+bid]);
 	}
 	__syncthreads();
 
 	if (tid0==0) {
 		n_k[bid] = sum;
-//		printf("%f \n",sum);
 	}
 	
 	
@@ -181,21 +177,16 @@ __global__ void M_step_uk_update(float* resp,float* data,float* n_k,float *u_k,i
 
 	for (int tid=tid0;tid<N;tid+=tot_threads) {
 		for (int i=0;i<D;i++) {
-			shared_val[i]+=resp[(tid*K)+bid]*data[(tid*D)+i];
-			//printf(" M_resp: %f \n",resp[(tid*K)+bid]);
-//			printf(" M_data: %f \n",data[(tid*D)+i]);
+			atomicAdd(&shared_val[i],resp[(tid*K)+bid]*data[(tid*D)+i]);
 		}
 	}
 	__syncthreads();
 
 	//atomic add:
 	if (tid0==0) {
-//	printf("invoked!");
 		for (int i=0;i<D;i++) {
 			u_k[(bid*D)+i] = shared_val[i]/n_k[bid];
-//			printf("%f ",u_k[(bid*D)+i]);
 		}
-//		printf("\n");
 	}
 }
 
@@ -219,7 +210,7 @@ __global__ void M_step_Ek_update(float* resp,float* data,float* u_k,float* E_k,f
 		for (int i=0;i<size;i++) {
 			int row = i/D;
 			int col = i%D;
-			shared_mat[i] += (resp[(tid*K)+bid])*(data[(tid*D)+row]-u_k[(bid*D)+row])*(data[(tid*D)+col]-u_k[(bid*D)+col]);
+			atomicAdd(&shared_mat[i],(resp[(tid*K)+bid])*(data[(tid*D)+row]-u_k[(bid*D)+row])*(data[(tid*D)+col]-u_k[(bid*D)+col]));
 		}
 	}
 
@@ -241,16 +232,6 @@ __global__ void pi_k_update(float* pi_k,float* n_k,int K,int N) {
 	}
 }
 
-__global__ void copy_LL(float* log_LL,float* prev_log_LL) {
-	*prev_log_LL = *log_LL;
-}
-
-
-
-
-
-
-
 int main() {
 
 	int K=3; int D=2; int N=200;
@@ -259,16 +240,22 @@ int main() {
 	float E_k[(K*D*D)];
 	float data[(N*D)];
 
-	float log_LL=0;
+
+	float log_LL=0; float prev_log_LL=0;
 
 	read_data(data,"data.csv");
 	read_data(pi_k,"weights.csv");
 	read_data(u_k,"means.csv");
 	read_data(E_k,"covariances.csv");
-
+/*
 	//before gpu data check:
 	printf("before:");
 		printf("\n");
+        printf("weights \n");
+        for (int i=0;i<K;i++) {
+                cout << pi_k[i] << " ";
+        }
+        printf("\n");
     printf("means: \n");	
 	for (int i=0;i<K;i++) {
 		for (int j=0;j<D;j++) {
@@ -281,14 +268,18 @@ int main() {
 	for (int k=0;k<K;k++) {
 		for (int i=0;i<D;i++) {
 			for (int j=0;j<D;j++) {
-				cout << E_k[(D*D*k)+(i*D)*j] << " ";
+				cout << E_k[(D*D*k)+(i*D)+j] << " ";
 			}
 		printf("\n");
 		}
 		printf("\n");
 	}
-
+*/
 	float* d_data;
+	float pi_val_calc = 2*M_PI; for (int i=1;i<D;i++) {pi_val_calc*=2*M_PI;}
+	float* d_pi_val;
+       	cudaMalloc((void**)&d_pi_val,sizeof(float)); 
+	cudaMemcpy(d_pi_val,&pi_val_calc, sizeof(float),cudaMemcpyHostToDevice);
 
 	float* d_pi_k;
 	float* d_u_k;
@@ -301,7 +292,6 @@ int main() {
 	float* d_resp_denom;
 	float* d_n_k;
 	float* d_log_LL;
-	float* d_prev_log_LL;
 
 	//cuda alloc
 	int alloc_size1 = K*sizeof(float);
@@ -321,7 +311,6 @@ int main() {
 	cudaMalloc((void**)&d_resp,alloc_size4);
 	cudaMalloc((void**)&d_resp_denom,N*sizeof(float));
 	cudaMalloc((void**)&d_log_LL,sizeof(float));
-	cudaMalloc((void**)&d_prev_log_LL,sizeof(float));
 	cudaMalloc((void**)&d_n_k,alloc_size1);
 
 
@@ -333,16 +322,18 @@ int main() {
 	cudaMemcpy(d_E_k,E_k,alloc_size3,cudaMemcpyHostToDevice);
 
 	cudaMemcpy(d_log_LL,&log_LL,sizeof(float),cudaMemcpyHostToDevice);
-	cudaMemcpy(d_prev_log_LL,&log_LL,sizeof(float),cudaMemcpyHostToDevice);
 
-
-for (int i=0;i<10;i++) {
+int max_iter = 500; float threshold=0.00001;
+for (int i=0;i<max_iter;i++) {
 	//kernel invocation
 	//calculate E matrix inverse and determinant
 	matrixInverse<<<K,1>>>(d_E_k,d_E_k_inv,d_E_k_det,D);
+	cudaDeviceSynchronize();
+
+
 
 	//M Step : calc gaussians & update responsibilities
-	gauss_calc<<<20,250>>>(d_gaussians,d_data,d_u_k,d_E_k_inv,d_E_k_det,N,K,D);
+	gauss_calc<<<20,250>>>(d_gaussians,d_data,d_u_k,d_E_k_inv,d_E_k_det,d_pi_val,N,K,D);
 	cudaDeviceSynchronize();
 
 	cudaMemset(d_log_LL, 0, sizeof(float));
@@ -362,12 +353,18 @@ for (int i=0;i<10;i++) {
 	pi_k_update<<<1,K>>>(d_pi_k,d_n_k,K,N);
 	cudaDeviceSynchronize();
 
-//	cudaMemcpy(u_k,d_u_k,alloc_size2,cudaMemcpyDeviceToHost);
-//	cudaMemcpy(E_k,d_E_k,alloc_size3,cudaMemcpyDeviceToHost);
+	cudaMemcpy(pi_k,d_pi_k,alloc_size1,cudaMemcpyDeviceToHost);
+	cudaMemcpy(u_k,d_u_k,alloc_size2,cudaMemcpyDeviceToHost);
+	cudaMemcpy(E_k,d_E_k,alloc_size3,cudaMemcpyDeviceToHost);
 	cudaMemcpy(&log_LL,d_log_LL,sizeof(float),cudaMemcpyDeviceToHost);
 	//print
 	/*
 	printf("after:");
+	printf("\n");
+	printf("weights \n");
+	for (int i=0;i<K;i++) {
+		cout << pi_k[i] << " ";
+	}
 	printf("\n");
     printf("means: \n");	
 	for (int i=0;i<K;i++) {
@@ -381,7 +378,7 @@ for (int i=0;i<10;i++) {
 	for (int k=0;k<K;k++) {
 		for (int i=0;i<D;i++) {
 			for (int j=0;j<D;j++) {
-				cout << E_k[(D*D*k)+(i*D)*j] << " ";
+				cout << E_k[(D*D*k)+(i*D)+j] << " ";
 			}
 		printf("\n");
 		}
@@ -389,12 +386,20 @@ for (int i=0;i<10;i++) {
 	}
 
 
-	printf("\n"); */
-	printf("LL: %f \n",log_LL);
+	printf("\n");*/ 
+	//compare logs
+	if (abs(log_LL-prev_log_LL)<threshold) {
+		break;
+	}
+	prev_log_LL = log_LL;
+	printf("LL: %f iter: %d \n",log_LL,i);
 //	cout << log_LL << endl;
 }
 
 }
 
+
+
+//kernel code:
 
 
