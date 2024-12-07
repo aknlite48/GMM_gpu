@@ -1,4 +1,5 @@
 # TO BUILD PROGRAM RUN
+module load cuda-12.4  
 bash make.bash
 
 # TO CLEAN BUILD FILES RUN
