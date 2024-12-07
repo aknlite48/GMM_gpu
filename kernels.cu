@@ -121,10 +121,12 @@ __global__ void M_step_nk_update(float* resp,float* data,float* n_k,float *u_k,i
 	__syncthreads();
 
 	//Nk calc
+	float temp_sum=0;
 	for (int tid=tid0;tid<N;tid+=tot_threads) {
-
-		atomicAdd(&sum,resp[(tid*K)+bid]);
+		temp_sum+=resp[(tid*K)+bid];
+		//atomicAdd(&sum,resp[(tid*K)+bid]);
 	}
+	atomicAdd(&sum,temp_sum);
 	__syncthreads();
 
 	if (tid0==0) {
@@ -146,11 +148,12 @@ __global__ void M_step_uk_update(float* resp,float* data,float* n_k,float *u_k,i
 	__syncthreads();
 
 
-
-	for (int tid=tid0;tid<N;tid+=tot_threads) {
-		for (int i=0;i<D;i++) {
-			atomicAdd(&shared_val[i],resp[(tid*K)+bid]*data[(tid*D)+i]);
-		}
+	for (int i=0;i<D;i++) {
+		float temp_sum=0;
+		for (int tid=tid0;tid<N;tid+=tot_threads) {
+			temp_sum+=resp[(tid*K)+bid]*data[(tid*D)+i];
+	}
+		atomicAdd(&shared_val[i],temp_sum);
 	}
 	__syncthreads();
 
@@ -177,15 +180,15 @@ __global__ void M_step_Ek_update(float* resp,float* data,float* u_k,float* E_k,f
 		shared_mat[i]=0;
 	}
 	__syncthreads();
-
-	for (int tid=tid0;tid<N;tid+=tot_threads) {
-		for (int i=0;i<size;i++) {
-			int row = i/D;
-			int col = i%D;
-			atomicAdd(&shared_mat[i],(resp[(tid*K)+bid])*(data[(tid*D)+row]-u_k[(bid*D)+row])*(data[(tid*D)+col]-u_k[(bid*D)+col]));
+                for (int i=0;i<size;i++) {
+                        int row = i/D;
+                        int col = i%D;
+			float temp_sum=0;
+for (int tid=tid0;tid<N;tid+=tot_threads) {
+temp_sum+=(resp[(tid*K)+bid])*(data[(tid*D)+row]-u_k[(bid*D)+row])*(data[(tid*D)+col]-u_k[(bid*D)+col]);
+}
+atomicAdd(&shared_mat[i],temp_sum);
 		}
-	}
-
 	__syncthreads();
 
 	if (tid0==0) {
@@ -195,7 +198,6 @@ __global__ void M_step_Ek_update(float* resp,float* data,float* u_k,float* E_k,f
 	}
 	
 }
-
 __global__ void pi_k_update(float* pi_k,float* n_k,int K,int N) {
 	//single block
 	int tid=threadIdx.x;
@@ -221,7 +223,7 @@ __global__ void add_label(float* resp,int* labels,int N,int K) {
 	}
 }
 
-extern "C" void GMM_training(float* pi_k,float* u_k,float* E_k,float* data,int K,int D,int N,float threshold) {
+extern "C" int GMM_training(float* pi_k,float* u_k,float* E_k,float* data,int K,int D,int N,float threshold,bool verbose,int max_iter) {
 
 	float log_LL=0; float prev_log_LL=0;
 
@@ -272,40 +274,48 @@ extern "C" void GMM_training(float* pi_k,float* u_k,float* E_k,float* data,int K
 	cudaMemcpy(d_pi_k,pi_k,alloc_size1,cudaMemcpyHostToDevice);
 	cudaMemcpy(d_u_k,u_k,alloc_size2,cudaMemcpyHostToDevice);
 	cudaMemcpy(d_E_k,E_k,alloc_size3,cudaMemcpyHostToDevice);
+	
+	int calc_blocks = 20;
+	int M_step_threads = 300;
+	if (N>=1e5) {
+		calc_blocks = 60;//M_step_threads=500;
+	}
 
-
-	int max_iter = 500;
+//	int max_iter = 500; 
+	int iters=0; if (verbose) {printf("\n");}
 	for (int i=0;i<max_iter;i++) {
+		iters++;
 		//kernel invocation
 		//calculate E matrix inverse and determinant
 		matrixInverse<<<K,1>>>(d_E_k,d_E_k_inv,d_E_k_det,D);
 		cudaDeviceSynchronize();
 
 		//M Step : calc gaussians & update responsibilities
-		gauss_calc<<<20,250>>>(d_gaussians,d_data,d_u_k,d_E_k_inv,d_E_k_det,d_pi_val,N,K,D);
+		gauss_calc<<<calc_blocks,500>>>(d_gaussians,d_data,d_u_k,d_E_k_inv,d_E_k_det,d_pi_val,N,K,D);
 		cudaDeviceSynchronize();
 
 		cudaMemset(d_log_LL, 0, sizeof(float));
-		resp_denom_update<<<20,250>>>(d_gaussians,d_pi_k,d_resp_denom,d_log_LL,N,K);
+		resp_denom_update<<<calc_blocks,500>>>(d_gaussians,d_pi_k,d_resp_denom,d_log_LL,N,K);
 		cudaDeviceSynchronize();
 
-		E_step<<<20,250>>>(d_gaussians,d_pi_k,d_resp,d_resp_denom,N,K);
+		E_step<<<calc_blocks,500>>>(d_gaussians,d_pi_k,d_resp,d_resp_denom,N,K);
 		cudaDeviceSynchronize();
 
-		M_step_nk_update<<<K,250>>>(d_resp,d_data,d_n_k,d_u_k,N,K,D);
+		M_step_nk_update<<<K,M_step_threads>>>(d_resp,d_data,d_n_k,d_u_k,N,K,D);
 		cudaDeviceSynchronize();
 
-		M_step_uk_update<<<K,250>>>(d_resp,d_data,d_n_k,d_u_k,N,K,D);
+		M_step_uk_update<<<K,M_step_threads>>>(d_resp,d_data,d_n_k,d_u_k,N,K,D);
 		cudaDeviceSynchronize();
 
-		M_step_Ek_update<<<K,250>>>(d_resp,d_data,d_u_k,d_E_k,d_n_k,N,K,D);
+		M_step_Ek_update<<<K,M_step_threads>>>(d_resp,d_data,d_u_k,d_E_k,d_n_k,N,K,D);
 		pi_k_update<<<1,K>>>(d_pi_k,d_n_k,K,N);
 		cudaDeviceSynchronize();
 
 		cudaMemcpy(&log_LL,d_log_LL,sizeof(float),cudaMemcpyDeviceToHost);
 
 		//compare logs
-		printf("LL: %f iter: %d \n",log_LL,i);
+	//	if (verbose) {printf("LL: %f iter: %d \n",log_LL,i);}
+	if (verbose) {std::cout << "\r\033[F" << "Iterations: " << i+1 << " LL: " << log_LL <<"\n"<< std::flush;}
 		if (abs(log_LL-prev_log_LL)<threshold) {
 			break;
 		}
@@ -326,6 +336,7 @@ extern "C" void GMM_training(float* pi_k,float* u_k,float* E_k,float* data,int K
 	cudaFree(d_log_LL);
 	cudaFree(d_n_k);
 	cudaFree(d_data);
+	return iters;
 }
 
 extern "C" void GMM_inference(int* labels,float* pi_k,float* u_k,float* E_k,float* data,int K,int D,int N) {
@@ -387,17 +398,17 @@ extern "C" void GMM_inference(int* labels,float* pi_k,float* u_k,float* E_k,floa
 	cudaDeviceSynchronize();
 
 	//M Step : calc gaussians & update responsibilities
-	gauss_calc<<<20,250>>>(d_gaussians,d_data,d_u_k,d_E_k_inv,d_E_k_det,d_pi_val,N,K,D);
+	gauss_calc<<<50,500>>>(d_gaussians,d_data,d_u_k,d_E_k_inv,d_E_k_det,d_pi_val,N,K,D);
 	cudaDeviceSynchronize();
 
 	cudaMemset(d_log_LL, 0, sizeof(float));
-	resp_denom_update<<<20,250>>>(d_gaussians,d_pi_k,d_resp_denom,d_log_LL,N,K);
+	resp_denom_update<<<50,500>>>(d_gaussians,d_pi_k,d_resp_denom,d_log_LL,N,K);
 	cudaDeviceSynchronize();
 
-	E_step<<<20,250>>>(d_gaussians,d_pi_k,d_resp,d_resp_denom,N,K);
+	E_step<<<50,500>>>(d_gaussians,d_pi_k,d_resp,d_resp_denom,N,K);
 	cudaDeviceSynchronize();
 
-	add_label<<<20,250>>>(d_resp,d_labels,N,K);
+	add_label<<<50,500>>>(d_resp,d_labels,N,K);
 	cudaDeviceSynchronize();
 
 	cudaMemcpy(labels,d_labels,N*sizeof(float),cudaMemcpyDeviceToHost);
